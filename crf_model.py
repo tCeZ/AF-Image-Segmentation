@@ -1,90 +1,84 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
-import tifffile as tiff
-from torch.utils.data import Dataset, DataLoader
-import os
+import pycrfsuite
 
-class TiffDataset(Dataset):
-    def __init__(self, image_dir, mask_dir):
-        self.image_dir = image_dir
-        self.mask_dir = mask_dir
-        self.image_filenames = os.listdir(image_dir)
-        self.mask_filenames = os.listdir(mask_dir)
+def create_unary_features(image):
+    # Extract simple unary features such as intensity and gradient
+    intensity = image.flatten()
+    gradient_x = np.gradient(image, axis=0).flatten()
+    gradient_y = np.gradient(image, axis=1).flatten()
+    
+    features = []
+    for i, val in enumerate(intensity):
+        features.append({
+            f'intensity_{val}': 1,
+            f'gradient_x_{gradient_x[i]}': 1,
+            f'gradient_y_{gradient_y[i]}': 1,
+        })
+    return features
 
-    def __len__(self):
-        return len(self.image_filenames)
+def create_pairwise_features(image):
+    # Example pairwise feature: horizontal and vertical pairwise connections
+    features = []
+    for i in range(image.shape[0]):
+        for j in range(image.shape[1]):
+            neighbors = []
+            if i > 0:
+                neighbors.append((i - 1, j))
+            if i < image.shape[0] - 1:
+                neighbors.append((i + 1, j))
+            if j > 0:
+                neighbors.append((i, j - 1))
+            if j < image.shape[1] - 1:
+                neighbors.append((i, j + 1))
+            features.append(neighbors)
+    return features
 
-    def __getitem__(self, idx):
-        image_filename = self.image_filenames[idx]
-        mask_filename = self.mask_filenames[idx]
-        image = tiff.imread(os.path.join(self.image_dir, image_filename))
-        mask = tiff.imread(os.path.join(self.mask_dir, mask_filename))
-        return torch.tensor(image, dtype=torch.float32), torch.tensor(mask, dtype=torch.long)
+def prepare_data(image, ground_truth):
+    X = [create_unary_features(image)]
+    y = [ground_truth.flatten().tolist()]
+    edges = create_pairwise_features(image)
+    return X, y, edges
 
-# Define the CRF layer in PyTorch
-class CRFLayer(nn.Module):
-    def __init__(self, n_classes):
-        super(CRFLayer, self).__init__()
-        self.n_classes = n_classes
-        self.transitions = nn.Parameter(torch.randn(n_classes, n_classes))
+def train_crf(X, y, edges):
+    trainer = pycrfsuite.Trainer(verbose=False)
 
-    def forward(self, logits, mask):
-        return self.compute_log_likelihood(logits, mask), self.decode(logits)
+    for xseq, yseq, edge in zip(X, y, edges):
+        trainer.set_params({
+            'c1': 0.1,  # coefficient for L1 penalty
+            'c2': 0.1,  # coefficient for L2 penalty
+            'num_memories': 6,  # number of truncated Newton steps in L-BFGS update
+            'max_iterations': 200,  # stop earlier
+            'feature.possible_transitions': True,
+            'feature.possible_states': True
+        })
 
-    def compute_log_likelihood(self, logits, mask):
-        batch_size, _, height, width = logits.shape
-        logits = logits.permute(0, 2, 3, 1).contiguous().view(-1, height * width, self.n_classes)
+        trainer.append(xseq, yseq, edge)
 
-        # Compute the partition function (forward pass)
-        alpha = logits[:, 0, :]
-        for t in range(1, height * width):
-            alpha_t = []
-            for j in range(self.n_classes):
-                emit_score = logits[:, t, j]
-                trans_score = self.transitions[j, :]
-                alpha_t_j = alpha[:, :] + trans_score + emit_score
-                alpha_t.append(torch.logsumexp(alpha_t_j, dim=1))
-            alpha = torch.stack(alpha_t, dim=1)
+    trainer.train('crf_model.crfsuite')
 
-        log_likelihood = torch.logsumexp(alpha, dim=1).sum()
-        return -log_likelihood / batch_size
+def predict_crf(image):
+    tagger = pycrfsuite.Tagger()
+    tagger.open('crf_model.crfsuite')
 
-    def decode(self, logits):
-        logits = logits.permute(0, 2, 3, 1).contiguous().view(-1, self.n_classes)
-        return torch.argmax(logits, dim=1).view(logits.shape[0], -1)
+    unary_features = create_unary_features(image)
+    y_pred = tagger.tag(unary_features)
 
-# Create a simple neural network with a CRF layer
-class ToyModel(nn.Module):
-    def __init__(self, n_classes):
-        super(ToyModel, self).__init__()
-        self.conv = nn.Conv2d(1, n_classes, kernel_size=1)
-        self.crf = CRFLayer(n_classes)
+    return np.array(y_pred).reshape(image.shape)
 
-    def forward(self, x):
-        x = self.conv(x)
-        return x
+# Create toy images and ground truth masks
+image_train = np.random.randint(0, 256, (10, 10))
+ground_truth_train = (image_train > 128).astype(int)
 
-    def loss(self, x, y):
-        logits = self.forward(x)
-        return self.crf(logits, y)
+image_test = np.random.randint(0, 256, (10, 10))
 
-    def predict(self, x):
-        logits = self.forward(x)
-        return self.crf.decode(logits)
+# Prepare data
+X, y, edges = prepare_data(image_train, ground_truth_train)
 
-# Set the image and mask directories
-image_dir = 'path/to/image/directory'
-mask_dir = 'path/to/mask/directory'
+# Train the CRF model
+train_crf(X, y, edges)
 
-# Create the dataset and data loader
-dataset = TiffDataset(image_dir, mask_dir)
-data_loader = DataLoader(dataset, batch_size=4, shuffle=True)
+# Perform prediction on a new image
+predicted_mask = predict_crf(image_test)
 
-# Instantiate the model, optimizer, and loss
-n_classes = 2
-model = ToyModel(n_classes)
-optimizer = optim.Adam(model.parameters(), lr=0.01)
+print(predicted_mask)
 
-# Train the model
